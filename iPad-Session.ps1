@@ -35,6 +35,8 @@ public class SessionNative {
     public const uint SDC_VALIDATE = 0x00000040;
     public const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
     public const uint SDC_ALLOW_CHANGES = 0x00000400;
+    public const uint SDC_TOPOLOGY_EXTEND = 0x00000004;
+    public const uint SDC_SAVE_TO_DATABASE = 0x00000200;
     public const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
     public const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
 
@@ -229,10 +231,30 @@ function Save-And-IsolateMttDisplay {
         }
 
         $mttIdx = [SessionNative]::FindMttPathIndex($paths)
+        $attempt = 0
+        while ($mttIdx -lt 0 -and $attempt -lt 10) {
+            # Race observed in session.log (05:33:18): MTT not yet active when prep-cmd ran. Retry for up to ~5 s.
+            Start-Sleep -Milliseconds 500
+            $attempt++
+            [uint32]$pc = 0; [uint32]$mc = 0
+            if ([SessionNative]::GetDisplayConfigBufferSizes([SessionNative]::QDC_ONLY_ACTIVE_PATHS, [ref]$pc, [ref]$mc) -ne 0) { continue }
+            $paths = New-Object SessionNative+DISPLAYCONFIG_PATH_INFO[] $pc
+            $modes = New-Object SessionNative+DISPLAYCONFIG_MODE_INFO[] $mc
+            if ([SessionNative]::QueryDisplayConfig([SessionNative]::QDC_ONLY_ACTIVE_PATHS, [ref]$pc, $paths, [ref]$mc, $modes, [IntPtr]::Zero) -ne 0) { continue }
+            $mttIdx = [SessionNative]::FindMttPathIndex($paths)
+        }
 
         if ($mttIdx -lt 0) {
             Write-SessionLog "MTT virtual display not found in active paths ($pc active); skipping display isolation"
             return
+        }
+
+        if ((Test-Path -LiteralPath $dispBakPath) -and $script:PriorStopCompleted -and $pc -gt 1) {
+            # A previous Stop completed but could not restore from this backup (session.log shows rc=87 every time),
+            # so the backup is stale. Archive it and capture the current multi-display topology instead.
+            $stale = "$dispBakPath.stale-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+            Move-Item -LiteralPath $dispBakPath -Destination $stale -Force -ErrorAction SilentlyContinue
+            Write-SessionLog "Archived stale display backup to $(Split-Path $stale -Leaf)"
         }
 
         if (-not (Test-Path -LiteralPath $dispBakPath)) {
@@ -283,7 +305,9 @@ function Save-And-IsolateMttDisplay {
         $singleModes = $modes.Clone()
         $srcModeIdx = $singlePath[0].sourceInfo.modeInfoIdx
         if ($srcModeIdx -lt $singleModes.Length -and $singleModes[$srcModeIdx].infoType -eq [SessionNative]::DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
-            for ($b = 8; $b -lt 16; $b++) { $singleModes[$srcModeIdx].data[$b] = 0 }
+            # DISPLAYCONFIG_SOURCE_MODE layout: width@0, height@4, pixelFormat@8, position.x@12, position.y@16.
+            # Original code zeroed bytes 8..15 (pixelFormat + position.x). Only the position must be zeroed.
+            for ($b = 12; $b -lt 20; $b++) { $singleModes[$srcModeIdx].data[$b] = 0 }
         }
         $flags = [SessionNative]::SDC_APPLY -bor [SessionNative]::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor [SessionNative]::SDC_ALLOW_CHANGES
         $sdcRc = [SessionNative]::SetDisplayConfig(1, $singlePath, [uint32]$singleModes.Length, $singleModes, $flags)
@@ -342,11 +366,27 @@ function Restore-DisplayTopology {
             $modes[$i] = $m
         }
 
-        $flags = [SessionNative]::SDC_APPLY -bor [SessionNative]::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor [SessionNative]::SDC_ALLOW_CHANGES
-        $rc = [SessionNative]::SetDisplayConfig([uint32]$paths.Length, $paths, [uint32]$modes.Length, $modes, $flags)
-        Write-SessionLog "Restored display topology from backup (rc=$rc, paths=$($paths.Length))"
+        $flags = [SessionNative]::SDC_APPLY -bor [SessionNative]::SDC_USE_SUPPLIED_DISPLAY_CONFIG -bor [SessionNative]::SDC_ALLOW_CHANGES -bor [SessionNative]::SDC_SAVE_TO_DATABASE
+        $rc = -1
+        for ($try = 1; $try -le 3; $try++) {
+            $rc = [SessionNative]::SetDisplayConfig([uint32]$paths.Length, $paths, [uint32]$modes.Length, $modes, $flags)
+            Write-SessionLog "Restore attempt $try from backup: SetDisplayConfig rc=$rc (paths=$($paths.Length))"
+            if ($rc -eq 0) { break }
+            # rc=87 (ERROR_INVALID_PARAMETER) usually means a target in the backup (often the MTT virtual
+            # display, which Sunshine may be reconfiguring at the same time) is not currently available.
+            Start-Sleep -Milliseconds 700
+        }
+        if ($rc -ne 0) {
+            # Fallback: ask Windows to re-apply its own persisted 'Extend' topology for the connected monitors.
+            $rc2 = [SessionNative]::SetDisplayConfig(0, $null, 0, $null, [SessionNative]::SDC_APPLY -bor [SessionNative]::SDC_TOPOLOGY_EXTEND)
+            Write-SessionLog "Fallback SDC_TOPOLOGY_EXTEND restore rc=$rc2"
+            if ($rc2 -eq 0) { $rc = 0 }
+        }
         if ($rc -eq 0) {
             Remove-Item -LiteralPath $dispBakPath -Force -ErrorAction SilentlyContinue
+            Write-SessionLog "Display topology restored; backup removed"
+        } else {
+            Write-SessionLog "WARNING: display topology NOT restored; backup kept. Run -Mode Recover or press Win+P > Extend."
         }
     } catch {
         Write-SessionLog "ERROR restoring display topology: $_"
@@ -379,6 +419,8 @@ $ttPath = 'HKCU:\Software\Microsoft\TabletTip\1.7'
 
 if ($Mode -eq 'Start') {
     Write-SessionLog "Starting iPad Workstation session"
+    # If no session_state.json exists, the previous Stop ran to completion (or this is the first run).
+    $script:PriorStopCompleted = -not (Test-Path -LiteralPath $statePath)
     try {
         if (-not (Test-Path $ttPath)) {
             New-Item -Path $ttPath -Force | Out-Null
@@ -417,7 +459,9 @@ if ($Mode -eq 'Start') {
         Set-CursorSizeImmediate 48
         Write-SessionLog "Live cursor size set to 48 (SPI_GETMOUSECURSORSIZE=$([SessionNative]::GetLiveCursorSize()))"
 
-        # Enable Windows 11 Touch Keyboard tray button & tap invoke
+        # Enable Windows 11 Touch Keyboard tray button & tap invoke.
+        # NOTE: auto-invoke only reacts to real touch/pen input. With Moonlight mouse emulation these keys have no
+        # visible effect; they become useful once native touch passthrough is in use (see docs/TECHNICAL_REVIEW.md).
         Set-ItemProperty -Path $ttPath -Name 'TipbandDesiredVisibility' -Value 1 -Type DWord -Force
         Set-ItemProperty -Path $ttPath -Name 'TouchKeyboardTapInvoke' -Value 1 -Type DWord -Force
         Set-ItemProperty -Path $ttPath -Name 'EnableDesktopModeAutoInvoke' -Value 1 -Type DWord -Force
@@ -455,8 +499,8 @@ if ($Mode -eq 'Start') {
             }
         }
     } catch {
-        Write-SessionLog "ERROR during Start: $_"
-        throw
+        # Never fail the Sunshine prep-cmd: a non-zero exit from a 'do' command aborts the stream launch.
+        Write-SessionLog "ERROR during Start (non-fatal, stream continues): $_"
     }
 }
 elseif ($Mode -eq 'Stop' -or $Mode -eq 'Recover') {
@@ -498,7 +542,8 @@ elseif ($Mode -eq 'Stop' -or $Mode -eq 'Recover') {
             Write-SessionLog "No session_state.json found; reset CursorBaseSize to 32"
         }
     } catch {
-        Write-SessionLog "ERROR during Stop/Recover: $_"
-        throw
+        Write-SessionLog "ERROR during Stop/Recover (non-fatal): $_"
     }
 }
+
+exit 0

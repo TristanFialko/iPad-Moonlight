@@ -493,7 +493,7 @@ $PID | Out-File -LiteralPath $pidFile -Force -Encoding ascii
                     <!-- Section 3: Window Management -->
                     <TextBlock Text="WINDOW MANAGEMENT" Style="{StaticResource SectionTitle}"/>
                     <WrapPanel Orientation="Horizontal" MaxWidth="680" Margin="0,0,0,8">
-                        <Button x:Name="BtnAltTab" Style="{StaticResource DrawerBtn}" ToolTip="Switch to Last App (Alt+Tab)">
+                        <Button x:Name="BtnAltTab" Style="{StaticResource DrawerBtn}" ToolTip="App Switcher (Ctrl+Alt+Tab, stays open for tapping)">
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="&#xE8AB;" Style="{StaticResource IconText}" Margin="0,0,7,0"/>
                                 <TextBlock Text="Last App" VerticalAlignment="Center"/>
@@ -837,7 +837,13 @@ $displayChangedHandler = [EventHandler]{
 [Microsoft.Win32.SystemEvents]::add_DisplaySettingsChanged($displayChangedHandler)
 
 $drag = $win.FindName("DragHandle")
-$drag.Add_MouseLeftButtonDown({ $win.DragMove() })
+# DragMove throws if the primary button is not down (touch-promoted or synthetic input). Guard it.
+$drag.Add_MouseLeftButtonDown({
+    param($sender, $e)
+    if ($e.LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
+        try { $win.DragMove() } catch {}
+    }
+})
 
 $panel = $win.FindName("ButtonsPanel")
 $runningPanel = $win.FindName("RunningAppsPanel")
@@ -1091,7 +1097,9 @@ $win.FindName("BtnReopenTab").Add_Click({  [TouchDockNative]::SendCombo(0x11, 0x
 $win.FindName("BtnZoomOut").Add_Click({    [TouchDockNative]::SendCombo(0x11, 0xBD) })       # Ctrl+-
 $win.FindName("BtnZoomIn").Add_Click({     [TouchDockNative]::SendCombo(0x11, 0xBB) })       # Ctrl++
 $win.FindName("BtnFullscreen").Add_Click({ [TouchDockNative]::SendCombo(0x7A) })             # F11
-$win.FindName("BtnAltTab").Add_Click({     [TouchDockNative]::SendCombo(0x12, 0x09) })       # Alt+Tab
+# Alt+Tab sent as an instant press/release only flips to the previous window. Ctrl+Alt+Tab opens the
+# persistent switcher, which stays on screen until a window is tapped - usable with touch/mouse emulation.
+$win.FindName("BtnAltTab").Add_Click({     [TouchDockNative]::SendCombo(0x11, 0x12, 0x09) }) # Ctrl+Alt+Tab
 $win.FindName("BtnGather").Add_Click({
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     [TouchDockNative]::GatherAllWindows($wa.Left, $wa.Top, $wa.Width, $wa.Height) | Out-Null
