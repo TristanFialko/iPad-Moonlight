@@ -1,0 +1,7 @@
+# Runtime artifacts written by iPad-Session.ps1 / iPad-TouchDock.ps1
+session.log
+touchdock.pid
+session_state.json
+display_topology_backup.json
+display_topology_backup.json.stale-*
+tools/input-diagnostics.log
