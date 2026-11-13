@@ -1,0 +1,165 @@
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet('Start','Stop')]
+    [string]$Mode
+)
+
+$ErrorActionPreference = 'Stop'
+$statePath = Join-Path $PSScriptRoot "session_state.json"
+$pidFile   = Join-Path $PSScriptRoot "touchdock.pid"
+$logFile   = Join-Path $PSScriptRoot "session.log"
+
+function Write-SessionLog([string]$msg) {
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    "$ts [$Mode] $msg" | Out-File -LiteralPath $logFile -Append -Encoding utf8 -ErrorAction SilentlyContinue
+}
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class CursorRefresh {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+
+function Set-CursorSizeImmediate([int]$size) {
+    $curPath = 'HKCU:\Control Panel\Cursors'
+    Set-ItemProperty -Path $curPath -Name 'CursorBaseSize' -Value $size -Type DWord -Force
+    # SPI_SETCURSORS (0x0057) reloads cursor scheme & size immediately
+    [CursorRefresh]::SystemParametersInfo(0x0057, 0, [IntPtr]::Zero, 3) | Out-Null
+}
+
+function Get-RunningDockPids {
+    $pids = @()
+    if (Test-Path -LiteralPath $pidFile) {
+        $raw = (Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($raw -match '^\d+$') {
+            $p = Get-Process -Id ([int]$raw) -ErrorAction SilentlyContinue
+            if ($p) { $pids += $p.Id }
+        }
+    }
+    try {
+        $wmi = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+               Where-Object {
+                   $_.ProcessId -ne $PID -and
+                   $_.CommandLine -match '-File\s+["'']?[^"'']*iPad-TouchDock\.ps1'
+               }
+        foreach ($proc in $wmi) {
+            if ($pids -notcontains $proc.ProcessId) { $pids += [int]$proc.ProcessId }
+        }
+    } catch {}
+    return $pids
+}
+
+$ttPath = 'HKCU:\Software\Microsoft\TabletTip\1.7'
+
+if ($Mode -eq 'Start') {
+    Write-SessionLog "Starting iPad Workstation session"
+    try {
+        if (-not (Test-Path $ttPath)) {
+            New-Item -Path $ttPath -Force | Out-Null
+        }
+
+        # Save original state once (do not overwrite if Start is called twice without Stop)
+        if (-not (Test-Path -LiteralPath $statePath)) {
+            $cur = Get-ItemProperty 'HKCU:\Control Panel\Cursors' -ErrorAction SilentlyContinue
+            $tt  = Get-ItemProperty $ttPath -ErrorAction SilentlyContinue
+            @{
+                CursorBaseSize              = if ($cur -and $null -ne $cur.CursorBaseSize) { [int]$cur.CursorBaseSize } else { 32 }
+                TipbandDesiredVisibility    = if ($tt -and $null -ne $tt.TipbandDesiredVisibility) { [int]$tt.TipbandDesiredVisibility } else { 0 }
+                TouchKeyboardTapInvoke      = if ($tt -and $null -ne $tt.TouchKeyboardTapInvoke) { [int]$tt.TouchKeyboardTapInvoke } else { 0 }
+                EnableDesktopModeAutoInvoke = if ($tt -and $null -ne $tt.EnableDesktopModeAutoInvoke) { [int]$tt.EnableDesktopModeAutoInvoke } else { 0 }
+            } | ConvertTo-Json | Out-File -LiteralPath $statePath -Encoding utf8 -Force
+            Write-SessionLog "Saved original state to session_state.json"
+        } else {
+            Write-SessionLog "session_state.json already exists; preserving original backup"
+        }
+
+        # Enlarge Bibata cursor for 10.9-inch iPad visibility (preserving existing Bibata scheme)
+        Set-CursorSizeImmediate 48
+        Write-SessionLog "CursorBaseSize set to 48"
+
+        # Enable Windows 11 Touch Keyboard tray button & tap invoke
+        Set-ItemProperty -Path $ttPath -Name 'TipbandDesiredVisibility' -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $ttPath -Name 'TouchKeyboardTapInvoke' -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $ttPath -Name 'EnableDesktopModeAutoInvoke' -Value 1 -Type DWord -Force
+        Write-SessionLog "TabletTip registry enabled"
+
+        # Start Touch Dock if not already running
+        $runningPids = Get-RunningDockPids
+        if ($runningPids.Count -eq 0) {
+            if (Test-Path -LiteralPath $pidFile) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue }
+            $dockScript = Join-Path $PSScriptRoot "iPad-TouchDock.ps1"
+            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dockScript`"" -WindowStyle Hidden
+            # Wait briefly for PID file to confirm launch
+            for ($i = 0; $i -lt 30; $i++) {
+                if (Test-Path -LiteralPath $pidFile) { break }
+                Start-Sleep -Milliseconds 100
+            }
+            Write-SessionLog "TouchDock started (pidFile exists: $(Test-Path -LiteralPath $pidFile))"
+        } else {
+            Write-SessionLog "TouchDock already running (PIDs: $($runningPids -join ', '))"
+        }
+
+        # Focus existing visible Brave window or launch Brave in Touch UI mode
+        $braveWin = Get-Process -Name 'brave' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+                    Select-Object -First 1
+        if ($braveWin) {
+            $h = $braveWin.MainWindowHandle
+            if ([CursorRefresh]::IsIconic($h)) { [CursorRefresh]::ShowWindow($h, 9) | Out-Null }
+            [CursorRefresh]::SetForegroundWindow($h) | Out-Null
+            Write-SessionLog "Focused existing Brave window (PID $($braveWin.Id))"
+        } else {
+            $braveLauncher = Join-Path $PSScriptRoot "Launch-Brave-iPad.cmd"
+            if (Test-Path -LiteralPath $braveLauncher) {
+                Start-Process -FilePath $braveLauncher -WindowStyle Hidden
+                Write-SessionLog "Launched Brave via Launch-Brave-iPad.cmd"
+            }
+        }
+    } catch {
+        Write-SessionLog "ERROR during Start: $_"
+        throw
+    }
+}
+elseif ($Mode -eq 'Stop') {
+    Write-SessionLog "Stopping iPad Workstation session"
+    try {
+        # Stop all Touch Dock instances
+        $runningPids = Get-RunningDockPids
+        foreach ($dpid in $runningPids) {
+            Stop-Process -Id $dpid -Force -ErrorAction SilentlyContinue
+            Write-SessionLog "Stopped TouchDock PID $dpid"
+        }
+        if (Test-Path -LiteralPath $pidFile) {
+            Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        }
+
+        # Restore original cursor size & TabletTip settings
+        if (Test-Path -LiteralPath $statePath) {
+            $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+            $origCursor = if ($null -ne $state.CursorBaseSize) { [int]$state.CursorBaseSize } else { 32 }
+            Set-CursorSizeImmediate $origCursor
+            if (Test-Path $ttPath) {
+                Set-ItemProperty -Path $ttPath -Name 'TipbandDesiredVisibility' -Value ([int]$state.TipbandDesiredVisibility) -Type DWord -Force
+                Set-ItemProperty -Path $ttPath -Name 'TouchKeyboardTapInvoke' -Value ([int]$state.TouchKeyboardTapInvoke) -Type DWord -Force
+                Set-ItemProperty -Path $ttPath -Name 'EnableDesktopModeAutoInvoke' -Value ([int]$state.EnableDesktopModeAutoInvoke) -Type DWord -Force
+            }
+            Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+            Write-SessionLog "Restored original state (CursorBaseSize=$origCursor) and removed session_state.json"
+        } else {
+            Set-CursorSizeImmediate 32
+            Write-SessionLog "No session_state.json found; reset CursorBaseSize to 32"
+        }
+    } catch {
+        Write-SessionLog "ERROR during Stop: $_"
+        throw
+    }
+}

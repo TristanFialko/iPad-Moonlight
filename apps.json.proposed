@@ -1,0 +1,34 @@
+{
+  "env": {},
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png"
+    },
+    {
+      "name": "iPad Workstation",
+      "prep-cmd": [
+        {
+          "do": "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:\\PC\\Dev_Tools\\iPad_Workstation\\iPad-Session.ps1\" -Mode Start",
+          "undo": "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:\\PC\\Dev_Tools\\iPad_Workstation\\iPad-Session.ps1\" -Mode Stop",
+          "elevated": false
+        }
+      ],
+      "auto-detach": true,
+      "image-path": "desktop.png"
+    },
+    {
+      "name": "Steam Big Picture",
+      "cmd": "steam://open/bigpicture",
+      "prep-cmd": [
+        {
+          "do": "",
+          "undo": "steam://close/bigpicture"
+        }
+      ],
+      "auto-detach": true,
+      "wait-all": true,
+      "image-path": "steam.png"
+    }
+  ]
+}

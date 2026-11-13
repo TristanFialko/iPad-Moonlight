@@ -1,0 +1,376 @@
+﻿# Lightweight, zero-install Touch Dock for iPad Moonlight sessions
+# Uses WS_EX_NOACTIVATE so tapping buttons never steals focus from Brave or active apps.
+param()
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class TouchDockNative {
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_NOACTIVATE = 0x08000000;
+    public const int WS_EX_TOOLWINDOW = 0x00000080;
+
+    public const uint INPUT_KEYBOARD = 1;
+    public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+    public const uint KEYEVENTF_KEYUP = 0x0002;
+
+    public const int SW_RESTORE = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+        public uint type;
+        public INPUTUNION u;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUTUNION {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+        [FieldOffset(0)] public HARDWAREINPUT hi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct HARDWAREINPUT {
+        public uint uMsg;
+        public ushort wParamL;
+        public ushort wParamH;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    private static bool IsExtendedKey(ushort vk) {
+        switch (vk) {
+            case 0x21: // PageUp
+            case 0x22: // PageDown
+            case 0x23: // End
+            case 0x24: // Home
+            case 0x25: // Left
+            case 0x26: // Up
+            case 0x27: // Right
+            case 0x28: // Down
+            case 0x2D: // Insert
+            case 0x2E: // Delete
+            case 0x5B: // LWin
+            case 0x5C: // RWin
+            case 0x5D: // Apps
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public static void SendCombo(params ushort[] keys) {
+        var inputs = new List<INPUT>(keys.Length * 2);
+        foreach (ushort k in keys) {
+            uint flags = IsExtendedKey(k) ? KEYEVENTF_EXTENDEDKEY : 0;
+            inputs.Add(new INPUT {
+                type = INPUT_KEYBOARD,
+                u = new INPUTUNION { ki = new KEYBDINPUT { wVk = k, dwFlags = flags } }
+            });
+        }
+        for (int i = keys.Length - 1; i >= 0; i--) {
+            ushort k = keys[i];
+            uint flags = KEYEVENTF_KEYUP | (IsExtendedKey(k) ? KEYEVENTF_EXTENDEDKEY : 0);
+            inputs.Add(new INPUT {
+                type = INPUT_KEYBOARD,
+                u = new INPUTUNION { ki = new KEYBDINPUT { wVk = k, dwFlags = flags } }
+            });
+        }
+        SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+"@
+
+# Write PID file so iPad-Session.ps1 -Mode Stop can close us cleanly
+$pidFile = Join-Path $PSScriptRoot "touchdock.pid"
+$PID | Out-File -LiteralPath $pidFile -Force -Encoding ascii
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="iPadTouchDock"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        SizeToContent="WidthAndHeight"
+        ResizeMode="NoResize">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Background" Value="#2A2D36"/>
+            <Setter Property="Foreground" Value="#F3F4F6"/>
+            <Setter Property="BorderBrush" Value="#3F4451"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Height" Value="44"/>
+            <Setter Property="MinWidth" Value="52"/>
+            <Setter Property="Padding" Value="11,4"/>
+            <Setter Property="Margin" Value="3"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bd" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="#3D4352"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="#2563EB"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <StackPanel Orientation="Vertical" HorizontalAlignment="Center">
+        <!-- Secondary Quick Actions drawer (hidden by default) -->
+        <Border x:Name="MoreDrawer" Visibility="Collapsed"
+                Background="#F0181A20" BorderBrush="#4B5563" BorderThickness="1"
+                CornerRadius="12" Padding="6" Margin="0,0,0,6" HorizontalAlignment="Center">
+            <WrapPanel Orientation="Horizontal" MaxWidth="760">
+                <Button x:Name="BtnSelAll" Content="Select All" ToolTip="Ctrl+A"/>
+                <Button x:Name="BtnFind" Content="Find" ToolTip="Ctrl+F"/>
+                <Button x:Name="BtnForward" Content="Fwd →" ToolTip="Alt+Right"/>
+                <Button x:Name="BtnRefresh" Content="↻ Reload" ToolTip="Ctrl+R"/>
+                <Button x:Name="BtnReopenTab" Content="↺ Tab" ToolTip="Reopen Closed Tab (Ctrl+Shift+T)"/>
+                <Button x:Name="BtnFullscreen" Content="⛶ Full" ToolTip="Fullscreen (F11)"/>
+                <Button x:Name="BtnSnapL" Content="◧ Left" ToolTip="Snap Window Left (Win+Left)"/>
+                <Button x:Name="BtnSnapR" Content="◨ Right" ToolTip="Snap Window Right (Win+Right)"/>
+                <Button x:Name="BtnMax" Content="⬜ Max" ToolTip="Maximize Window (Win+Up)"/>
+                <Button x:Name="BtnMin" Content="⎯ Min" ToolTip="Minimize Window (Win+Down)"/>
+                <Button x:Name="BtnFiles" Content="📁 Files" ToolTip="Open File Explorer"/>
+                <Button x:Name="BtnSnip" Content="✂ Snip" ToolTip="Screenshot (Win+Shift+S)"/>
+                <Button x:Name="BtnVolDown" Content="🔉 -" MinWidth="46" ToolTip="Volume Down"/>
+                <Button x:Name="BtnVolMute" Content="🔇" MinWidth="44" ToolTip="Mute / Unmute"/>
+                <Button x:Name="BtnVolUp" Content="🔊 +" MinWidth="46" ToolTip="Volume Up"/>
+                <Button x:Name="BtnSettings" Content="⚙ Settings" ToolTip="Windows Settings"/>
+            </WrapPanel>
+        </Border>
+
+        <!-- Primary Dock Bar -->
+        <Border Background="#E6181A20" BorderBrush="#4B5563" BorderThickness="1" CornerRadius="12" Padding="6" HorizontalAlignment="Center">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                <Border x:Name="DragHandle" Background="#23262F" CornerRadius="6" Padding="8,11" Margin="2,0,4,0" Cursor="SizeAll" ToolTip="Drag Dock">
+                    <TextBlock Text="⋮⋮" Foreground="#9CA3AF" FontWeight="Bold" FontSize="14" VerticalAlignment="Center"/>
+                </Border>
+
+                <StackPanel x:Name="ButtonsPanel" Orientation="Horizontal">
+                    <Button x:Name="BtnKB" Content="⌨ KB" Background="#1D4ED8" ToolTip="Open Windows Touch Keyboard"/>
+                    <Button x:Name="BtnSwitch" Content="⧉ Apps" ToolTip="Task View (Switch Apps)"/>
+                    <Button x:Name="BtnDesk" Content="🖥 Desk" ToolTip="Show Desktop"/>
+                    <Button x:Name="BtnBrave" Content="🌐 Brave" ToolTip="Focus or Launch Brave"/>
+                    <Button x:Name="BtnBack" Content="←" MinWidth="42" ToolTip="Back (Alt+Left)"/>
+                    <Button x:Name="BtnNewTab" Content="+ Tab" ToolTip="New Tab (Ctrl+T)"/>
+                    <Button x:Name="BtnNextTab" Content="Tab ▸" ToolTip="Next Tab (Ctrl+Tab)"/>
+                    <Button x:Name="BtnCloseTab" Content="✕ Tab" ToolTip="Close Tab (Ctrl+W)"/>
+                    <Button x:Name="BtnCopy" Content="Copy" ToolTip="Copy (Ctrl+C)"/>
+                    <Button x:Name="BtnPaste" Content="Paste" ToolTip="Paste (Ctrl+V)"/>
+                    <Button x:Name="BtnUndo" Content="Undo" ToolTip="Undo (Ctrl+Z)"/>
+                    <Button x:Name="BtnMenu" Content="☰ Menu" ToolTip="Context Menu (Shift+F10)"/>
+                    <Button x:Name="BtnMore" Content="⋯" MinWidth="42" Background="#313644" ToolTip="More Actions"/>
+                </StackPanel>
+
+                <Button x:Name="BtnCollapse" Content="◀" MinWidth="38" Background="#374151" ToolTip="Collapse / Expand Dock"/>
+            </StackPanel>
+        </Border>
+    </StackPanel>
+</Window>
+"@
+
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$win = [Windows.Markup.XamlReader]::Load($reader)
+
+function Position-DockBottomCenter {
+    param([switch]$ForceCenter)
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $source = [System.Windows.PresentationSource]::FromVisual($win)
+    $scaleX = 1.0
+    $scaleY = 1.0
+    if ($source -and $source.CompositionTarget) {
+        $m = $source.CompositionTarget.TransformFromDevice
+        $scaleX = $m.M11
+        $scaleY = $m.M22
+    }
+    $waLeft   = $wa.Left * $scaleX
+    $waTop    = $wa.Top * $scaleY
+    $waWidth  = $wa.Width * $scaleX
+    $waHeight = $wa.Height * $scaleY
+
+    $w = if ($win.ActualWidth -gt 0) { $win.ActualWidth } else { 860 }
+    $h = if ($win.ActualHeight -gt 0) { $win.ActualHeight } else { 64 }
+
+    if ($ForceCenter -or [double]::IsNaN($win.Left) -or [double]::IsNaN($win.Top)) {
+        $win.Left = $waLeft + [Math]::Max(12, ($waWidth - $w) / 2)
+        $win.Top  = $waTop + $waHeight - $h - 10
+    } else {
+        # Clamp inside current primary work area
+        $win.Left = [Math]::Min([Math]::Max($waLeft + 8, $win.Left), $waLeft + $waWidth - $w - 8)
+        $win.Top  = [Math]::Min([Math]::Max($waTop + 8, $win.Top),  $waTop + $waHeight - $h - 8)
+    }
+}
+
+$win.Add_SourceInitialized({
+    $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper $win).Handle
+    $ex = [TouchDockNative]::GetWindowLong($hwnd, [TouchDockNative]::GWL_EXSTYLE)
+    [TouchDockNative]::SetWindowLong($hwnd, [TouchDockNative]::GWL_EXSTYLE, $ex -bor [TouchDockNative]::WS_EX_NOACTIVATE -bor [TouchDockNative]::WS_EX_TOOLWINDOW) | Out-Null
+})
+
+$win.Add_Loaded({
+    Position-DockBottomCenter -ForceCenter
+})
+
+$displayChangedHandler = [EventHandler]{
+    $win.Dispatcher.Invoke([Action]{
+        Position-DockBottomCenter -ForceCenter
+    })
+}
+[Microsoft.Win32.SystemEvents]::add_DisplaySettingsChanged($displayChangedHandler)
+
+$drag = $win.FindName("DragHandle")
+$drag.Add_MouseLeftButtonDown({ $win.DragMove() })
+
+$panel = $win.FindName("ButtonsPanel")
+$moreDrawer = $win.FindName("MoreDrawer")
+$btnMore = $win.FindName("BtnMore")
+$btnCollapse = $win.FindName("BtnCollapse")
+
+$btnCollapse.Add_Click({
+    if ($panel.Visibility -eq 'Visible') {
+        $moreDrawer.Visibility = 'Collapsed'
+        $panel.Visibility = 'Collapsed'
+        $btnCollapse.Content = 'iPad ▶'
+        $btnCollapse.MinWidth = 68
+    } else {
+        $panel.Visibility = 'Visible'
+        $btnCollapse.Content = '◀'
+        $btnCollapse.MinWidth = 38
+    }
+    $win.Dispatcher.BeginInvoke([Action]{ Position-DockBottomCenter }, [System.Windows.Threading.DispatcherPriority]::Loaded) | Out-Null
+})
+
+$btnMore.Add_Click({
+    if ($moreDrawer.Visibility -eq 'Visible') {
+        $moreDrawer.Visibility = 'Collapsed'
+        $btnMore.Background = '#313644'
+    } else {
+        $moreDrawer.Visibility = 'Visible'
+        $btnMore.Background = '#2563EB'
+    }
+    $win.Dispatcher.BeginInvoke([Action]{ Position-DockBottomCenter }, [System.Windows.Threading.DispatcherPriority]::Loaded) | Out-Null
+})
+
+# Touch Keyboard: TabTip.exe signals TextInputHost without stealing focus on Win11
+$win.FindName("BtnKB").Add_Click({
+    $tabTip = "C:\Program Files\Common Files\microsoft shared\ink\TabTip.exe"
+    if (Test-Path -LiteralPath $tabTip) {
+        Start-Process -FilePath $tabTip -ErrorAction SilentlyContinue
+    } else {
+        [TouchDockNative]::SendCombo(0x5B, 0x11, 0x4F) # Win+Ctrl+O fallback
+    }
+})
+
+# Primary bar actions
+$win.FindName("BtnSwitch").Add_Click({   [TouchDockNative]::SendCombo(0x5B, 0x09) })       # Win+Tab
+$win.FindName("BtnDesk").Add_Click({     [TouchDockNative]::SendCombo(0x5B, 0x44) })       # Win+D
+$win.FindName("BtnBack").Add_Click({     [TouchDockNative]::SendCombo(0x12, 0x25) })       # Alt+Left
+$win.FindName("BtnNewTab").Add_Click({   [TouchDockNative]::SendCombo(0x11, 0x54) })       # Ctrl+T
+$win.FindName("BtnNextTab").Add_Click({  [TouchDockNative]::SendCombo(0x11, 0x09) })       # Ctrl+Tab
+$win.FindName("BtnCloseTab").Add_Click({ [TouchDockNative]::SendCombo(0x11, 0x57) })       # Ctrl+W
+$win.FindName("BtnCopy").Add_Click({     [TouchDockNative]::SendCombo(0x11, 0x43) })       # Ctrl+C
+$win.FindName("BtnPaste").Add_Click({    [TouchDockNative]::SendCombo(0x11, 0x56) })       # Ctrl+V
+$win.FindName("BtnUndo").Add_Click({     [TouchDockNative]::SendCombo(0x11, 0x5A) })       # Ctrl+Z
+$win.FindName("BtnMenu").Add_Click({     [TouchDockNative]::SendCombo(0x10, 0x79) })       # Shift+F10
+
+$win.FindName("BtnBrave").Add_Click({
+    $braveWin = Get-Process -Name 'brave' -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+                Select-Object -First 1
+    if ($braveWin) {
+        $h = $braveWin.MainWindowHandle
+        if ([TouchDockNative]::IsIconic($h)) {
+            [TouchDockNative]::ShowWindow($h, [TouchDockNative]::SW_RESTORE) | Out-Null
+        }
+        [TouchDockNative]::SetForegroundWindow($h) | Out-Null
+    } else {
+        $launcher = Join-Path $PSScriptRoot "Launch-Brave-iPad.cmd"
+        if (Test-Path -LiteralPath $launcher) {
+            Start-Process -FilePath $launcher -WindowStyle Hidden
+        }
+    }
+})
+
+# Secondary Quick Actions drawer
+$win.FindName("BtnSelAll").Add_Click({     [TouchDockNative]::SendCombo(0x11, 0x41) })       # Ctrl+A
+$win.FindName("BtnFind").Add_Click({       [TouchDockNative]::SendCombo(0x11, 0x46) })       # Ctrl+F
+$win.FindName("BtnForward").Add_Click({    [TouchDockNative]::SendCombo(0x12, 0x27) })       # Alt+Right
+$win.FindName("BtnRefresh").Add_Click({    [TouchDockNative]::SendCombo(0x11, 0x52) })       # Ctrl+R
+$win.FindName("BtnReopenTab").Add_Click({  [TouchDockNative]::SendCombo(0x11, 0x10, 0x54) }) # Ctrl+Shift+T
+$win.FindName("BtnFullscreen").Add_Click({ [TouchDockNative]::SendCombo(0x7A) })             # F11
+$win.FindName("BtnSnapL").Add_Click({      [TouchDockNative]::SendCombo(0x5B, 0x25) })       # Win+Left
+$win.FindName("BtnSnapR").Add_Click({      [TouchDockNative]::SendCombo(0x5B, 0x27) })       # Win+Right
+$win.FindName("BtnMax").Add_Click({        [TouchDockNative]::SendCombo(0x5B, 0x26) })       # Win+Up
+$win.FindName("BtnMin").Add_Click({        [TouchDockNative]::SendCombo(0x5B, 0x28) })       # Win+Down
+$win.FindName("BtnSnip").Add_Click({       [TouchDockNative]::SendCombo(0x5B, 0x10, 0x53) }) # Win+Shift+S
+$win.FindName("BtnVolDown").Add_Click({    [TouchDockNative]::SendCombo(0xAE) })             # VK_VOLUME_DOWN
+$win.FindName("BtnVolMute").Add_Click({    [TouchDockNative]::SendCombo(0xAD) })             # VK_VOLUME_MUTE
+$win.FindName("BtnVolUp").Add_Click({      [TouchDockNative]::SendCombo(0xAF) })             # VK_VOLUME_UP
+$win.FindName("BtnFiles").Add_Click({      Start-Process "explorer.exe" })
+$win.FindName("BtnSettings").Add_Click({   Start-Process "ms-settings:" })
+
+$win.Add_Closed({
+    [Microsoft.Win32.SystemEvents]::remove_DisplaySettingsChanged($displayChangedHandler)
+    if (Test-Path -LiteralPath $pidFile) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue }
+})
+
+$win.ShowDialog() | Out-Null
